@@ -1225,6 +1225,11 @@ static void sdhci_msm_set_mmc_drv_type(struct sdhci_host *host, u32 opcode,
 void sdhci_msm_mm_dbg_configure(struct sdhci_host *host, u32 mask,
 			u32 match, u32 bit_shift, u32 testbus)
 {
+	struct sdhci_host *host = mmc_priv(mmc);
+	int tuning_seq_cnt = 10;
+	u8 phase, tuned_phases[16], tuned_phase_cnt = 0;
+	int rc;
+	struct mmc_ios ios = host->mmc->ios;
 	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
 	struct sdhci_msm_host *msm_host = pltfm_host->priv;
 	struct platform_device *pdev = msm_host->pdev;
@@ -1617,6 +1622,22 @@ retry:
 		sdhci_msm_set_mmc_drv_type(host, opcode, 0);
 
 	if (tuned_phase_cnt) {
+		if (tuned_phase_cnt == ARRAY_SIZE(tuned_phases)) {
+			/*
+			 * All phases valid is _almost_ as bad as no phases
+			 * valid.  Probably all phases are not really reliable
+			 * but we didn't detect where the unreliable place is.
+			 * That means we'll essentially be guessing and hoping
+			 * we get a good phase.  Better to try a few times.
+			 */
+			dev_dbg(mmc_dev(mmc), "%s: All phases valid; try again\n",
+				mmc_hostname(mmc));
+			if (--tuning_seq_cnt) {
+				tuned_phase_cnt = 0;
+				goto retry;
+			}
+		}
+
 		rc = msm_find_most_appropriate_phase(host, tuned_phases,
 							tuned_phase_cnt);
 		if (rc < 0)
