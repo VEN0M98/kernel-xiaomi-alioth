@@ -1439,8 +1439,15 @@ int sdhci_msm_execute_tuning(struct sdhci_host *host, u32 opcode)
 		return 0;
 
 	/*
-	 * Don't allow re-tuning for CRC errors observed for any commands
-	 * that are sent during tuning sequence itself.
+	 * Clear tuning_done flag before tuning to ensure proper
+	 * HS400 settings.
+	 */
+	msm_host->tuning_done = 0;
+
+	/*
+	 * For HS400 tuning in HS200 timing requires:
+	 * - select MCLK/2 in VENDOR_SPEC
+	 * - program MCLK to 400MHz (or nearest supported) in GCC
 	 */
 	if (msm_host->tuning_in_progress)
 		return 0;
@@ -5058,205 +5065,15 @@ static struct sdhci_ops sdhci_msm_ops = {
 	.hw_reset = sdhci_msm_hw_reset,
 };
 
-static void sdhci_set_default_hw_caps(struct sdhci_msm_host *msm_host,
-		struct sdhci_host *host)
-{
-	u32 version, caps = 0;
-	u16 minor;
-	u8 major;
-	u32 val;
-	const struct sdhci_msm_offset *msm_host_offset =
-					msm_host->offset;
+static const struct sdhci_pltfm_data sdhci_msm_pdata = {
+	.quirks = SDHCI_QUIRK_BROKEN_CARD_DETECTION |
+		  SDHCI_QUIRK_SINGLE_POWER_WRITE |
+		  SDHCI_QUIRK_CAP_CLOCK_BASE_BROKEN |
+		  SDHCI_QUIRK_MULTIBLOCK_READ_ACMD12,
 
-	version = sdhci_msm_readl_relaxed(host,
-		msm_host_offset->CORE_MCI_VERSION);
-	major = (version & CORE_VERSION_MAJOR_MASK) >>
-			CORE_VERSION_MAJOR_SHIFT;
-	minor = version & CORE_VERSION_TARGET_MASK;
-
-	caps = readl_relaxed(host->ioaddr + SDHCI_CAPABILITIES);
-
-	/*
-	 * Starting with SDCC 5 controller (core major version = 1)
-	 * controller won't advertise 3.0v, 1.8v and 8-bit features
-	 * except for some targets.
-	 */
-	if (major >= 1 && minor != 0x11 && minor != 0x12) {
-		struct sdhci_msm_reg_data *vdd_io_reg;
-		/*
-		 * Enable 1.8V support capability on controllers that
-		 * support dual voltage
-		 */
-		vdd_io_reg = msm_host->pdata->vreg_data->vdd_io_data;
-		if (vdd_io_reg && (vdd_io_reg->high_vol_level > 2700000))
-			caps |= CORE_3_0V_SUPPORT;
-		if (vdd_io_reg && (vdd_io_reg->low_vol_level < 1950000))
-			caps |= CORE_1_8V_SUPPORT;
-		if (msm_host->pdata->mmc_bus_width == MMC_CAP_8_BIT_DATA)
-			caps |= CORE_8_BIT_SUPPORT;
-	}
-
-	/*
-	 * Enable one MID mode for SDCC5 (major 1) on 8916/8939 (minor 0x2e) and
-	 * on 8992 (minor 0x3e) as a workaround to reset for data stuck issue.
-	 */
-	if (major == 1 && (minor == 0x2e || minor == 0x3e)) {
-		host->quirks2 |= SDHCI_QUIRK2_USE_RESET_WORKAROUND;
-		val = readl_relaxed(host->ioaddr +
-			msm_host_offset->CORE_VENDOR_SPEC_FUNC2);
-		writel_relaxed((val | CORE_ONE_MID_EN),
-			host->ioaddr + msm_host_offset->CORE_VENDOR_SPEC_FUNC2);
-	}
-	/*
-	 * SDCC 5 controller with major version 1, minor version 0x34 and later
-	 * with HS 400 mode support will use CM DLL instead of CDC LP 533 DLL.
-	 */
-	if ((major == 1) && (minor < 0x34))
-		msm_host->use_cdclp533 = true;
-
-	/*
-	 * SDCC 5 controller with major version 1, minor version 0x42 and later
-	 * will require additional steps when resetting DLL.
-	 * It also supports HS400 enhanced strobe mode.
-	 */
-	if ((major == 1) && (minor >= 0x42)) {
-		msm_host->use_updated_dll_reset = true;
-		msm_host->enhanced_strobe = true;
-		msm_host->pdata->caps2 |= MMC_CAP2_HS400_ES;
-	}
-
-	/*
-	 * SDCC 5 controller with major version 1 and minor version 0x42,
-	 * 0x46 and 0x49 currently uses 14lpp tech DLL whose internal
-	 * gating cannot guarantee MCLK timing requirement i.e.
-	 * when MCLK is gated OFF, it is not gated for less than 0.5us
-	 * and MCLK must be switched on for at-least 1us before DATA
-	 * starts coming.
-	 */
-	if ((major == 1) && ((minor == 0x42) || (minor == 0x46) ||
-				(minor == 0x49) || (minor >= 0x6b)))
-		msm_host->use_14lpp_dll = true;
-
-	/* Fake 3.0V support for SDIO devices which requires such voltage */
-	if (msm_host->core_3_0v_support) {
-		caps |= CORE_3_0V_SUPPORT;
-			writel_relaxed((readl_relaxed(host->ioaddr +
-			SDHCI_CAPABILITIES) | caps), host->ioaddr +
-			msm_host_offset->CORE_VENDOR_SPEC_CAPABILITIES0);
-	}
-
-	if ((major == 1) && (minor >= 0x49))
-		msm_host->rclk_delay_fix = true;
-	/*
-	 * Mask 64-bit support for controller with 32-bit address bus so that
-	 * smaller descriptor size will be used and improve memory consumption.
-	 */
-	if (!msm_host->pdata->largeaddressbus)
-		caps &= ~CORE_SYS_BUS_SUPPORT_64_BIT;
-
-	writel_relaxed(caps, host->ioaddr +
-		msm_host_offset->CORE_VENDOR_SPEC_CAPABILITIES0);
-	/* keep track of the value in SDHCI_CAPABILITIES */
-	msm_host->caps_0 = caps;
-
-	if ((major == 1) && (minor >= 0x6b)) {
-		host->cdr_support = true;
-	}
-
-	/* 7FF projects with 7nm DLL */
-	if ((major == 1) && ((minor == 0x6e) || (minor == 0x71) ||
-				(minor == 0x72)))
-		msm_host->use_7nm_dll = true;
-}
-
-static bool sdhci_msm_is_bootdevice(struct device *dev)
-{
-	if (strnstr(saved_command_line, "androidboot.bootdevice=",
-		    strlen(saved_command_line))) {
-		char search_string[50];
-
-		snprintf(search_string, ARRAY_SIZE(search_string),
-			"androidboot.bootdevice=%s", dev_name(dev));
-		if (strnstr(saved_command_line, search_string,
-		    strlen(saved_command_line)))
-			return true;
-		else
-			return false;
-	}
-
-	/*
-	 * "androidboot.bootdevice=" argument is not present then
-	 * return true as we don't know the boot device anyways.
-	 */
-	return true;
-}
-
-static int sdhci_msm_setup_ice_clk(struct sdhci_msm_host *msm_host,
-						struct platform_device *pdev)
-{
-	int ret = 0;
-
-	/* Setup SDC ICE clock */
-	msm_host->ice_clk = devm_clk_get(&pdev->dev, "ice_core_clk");
-	if (!IS_ERR(msm_host->ice_clk)) {
-		/* ICE core has only one clock frequency for now */
-		ret = clk_set_rate(msm_host->ice_clk,
-				msm_host->pdata->ice_clk_max);
-		if (ret) {
-			dev_err(&pdev->dev, "ICE_CLK rate set failed (%d) for %u\n",
-				ret,
-				msm_host->pdata->ice_clk_max);
-			return ret;
-		}
-		ret = clk_prepare_enable(msm_host->ice_clk);
-		if (ret)
-			return ret;
-		msm_host->ice_clk_rate =
-			msm_host->pdata->ice_clk_max;
-	}
-
-	return ret;
-}
-
-/*
- * Changes the bus speed mode for eMMC only as per the
- * kernel command line parameter passed in the boot image.
- * If not set remains in HS400ES mode.
- */
-static void sdhci_msm_select_bus_mode(struct sdhci_host *host)
-{
-	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
-	struct sdhci_msm_host *msm_host = pltfm_host->priv;
-	enum select_bus_mode {SELECT_HS400ES, SELECT_HS400,
-				SELECT_HS200, SELECT_DDR52,
-				SELECT_HS};
-
-	if (bus_mode) {
-		if (bus_mode == SELECT_HS400) {
-			msm_host->enhanced_strobe = false;
-			msm_host->pdata->caps2 &= ~(MMC_CAP2_HS400_ES);
-		} else if (bus_mode == SELECT_HS200) {
-			msm_host->pdata->caps2 &= ~(MMC_CAP2_HS400_ES);
-			msm_host->pdata->caps2 &= ~(MMC_CAP2_HS400);
-		} else if (bus_mode == SELECT_DDR52) {
-			host->quirks2 |= SDHCI_QUIRK2_BROKEN_HS200;
-			msm_host->pdata->caps2 &= ~(MMC_CAP2_HS400_ES);
-			msm_host->pdata->caps2 &= ~(MMC_CAP2_HS400);
-			msm_host->pdata->caps2 &= ~(MMC_CAP2_HS200);
-		} else if (bus_mode == SELECT_HS) {
-			host->quirks2 |= SDHCI_QUIRK2_BROKEN_HS200;
-			msm_host->pdata->caps2 &= ~(MMC_CAP2_HS400_ES);
-			msm_host->pdata->caps2 &= ~(MMC_CAP2_HS400);
-			msm_host->pdata->caps2 &= ~(MMC_CAP2_HS200);
-			msm_host->pdata->caps &= ~(MMC_CAP_3_3V_DDR |
-					MMC_CAP_1_8V_DDR | MMC_CAP_1_2V_DDR);
-			msm_host->mmc->clk_scaling.lower_bus_speed_mode &=
-				~(MMC_SCALING_LOWER_DDR52_MODE);
-		}
-		pr_info("%s: %s: bus_mode=%d set using kernel command line\n",
-			mmc_hostname(host->mmc), __func__, bus_mode);
-	}
-}
+	.quirks2 = SDHCI_QUIRK2_PRESET_VALUE_BROKEN,
+	.ops = &sdhci_msm_ops,
+};
 
 static int sdhci_msm_probe(struct platform_device *pdev)
 {
